@@ -1,0 +1,147 @@
+#!/usr/bin/python
+# This software is provided by the copyright owner "as is" and any
+# expressed or implied warranties, including, but not limited to,
+# the implied warranties of merchantability and fitness for a particular
+# purpose are disclaimed. In no event shall the copyright owner be
+# liable for any direct, indirect, incidential, special, exemplary or
+# consequential damages, including, but not limited to, procurement
+# of substitute goods or services, loss of use, data or profits or
+# business interruption, however caused and on any theory of liability,
+# whether in contract, strict liability, or tort, including negligence
+# or otherwise, arising in any way out of the use of this software,
+# even if advised of the possibility of such damage.
+#
+# Copyright (c) 2013 halfdog <me (%) halfdog.net>
+#
+# This program allows to intercept invocation of GnuPG, e.g. from
+# software like EnigMail, and forward the request to a remote
+# instance of GnuPG using its own keystore. That allows to use
+# GnuPG operations on platforms with lower trust level without
+# the risk to loose the private key material when the system is
+# compromised. This might be especially relevant when using GnuPG
+# to sign and decrypt e-mail: when running GnuPG within the same
+# host or user context of the e-mail client, that would enable
+# an attacker to use the rather large attack surface of the e-mail
+# client, often bundled with a web-browser, to access private
+# key and passphrase and to send that data via e-mail or web
+# requests.
+#
+# This helper only forwards those GnuPG requests, that require
+# private key material, e.g. signing or decryption. All other
+# requests, e.g. signature verification, are done locally.
+#
+# Usage:
+# Use this program instead of GnuPG to invoke it from EnigMail.
+# It supports all the arguments of GnuPG but additionally:
+# * --GnupgForwardRemoteAddress [host]:[port]: The address of the
+#     remote GnuPG instance
+# * --LogFile [filename]: logfile location (for debugging)
+#
+# Source: Projects/CryptoTools/Source/Python/RemoteGnupg/GnupgCallForwarder V20130519
+
+import os
+import time
+import select
+import socket
+import struct
+import sys
+
+logFile=None
+remoteAddress=None
+
+callArgs=sys.argv
+argPos=0
+while argPos < len(callArgs):
+  if callArgs[argPos] == '--GnupgForwardRemoteAddress':
+    remoteAddress=callArgs[argPos+1].split(':')
+    remoteAddress=(remoteAddress[0], int(remoteAddress[1]))
+    callArgs=callArgs[0:argPos]+callArgs[argPos+2:]
+  elif callArgs[argPos] == '--LogFile':
+    logFile=open(callArgs[argPos+1], 'a')
+    callArgs=callArgs[0:argPos]+callArgs[argPos+2:]
+  else:
+    argPos+=1
+
+
+if remoteAddress == None:
+  print >>sys.stderr, "Remote address parameter missing"
+  sys.exit(1)
+
+forwardRequestFlag=False
+argPos=len(callArgs)-1
+forwardArgs=''
+while argPos > 0:
+  argValue=callArgs[argPos]
+  forwardArgs=argValue+'\x00'+forwardArgs
+  if (argValue == '--clearsign') or (argValue == '--decrypt') or ((argValue == '--encrypt') and (argPos+1 != len(callArgs)) and (callArgs[argPos+1] == '--sign')): forwardRequestFlag=True
+  argPos-=1
+
+if logFile != None: logFile.write("%i: call arguments are %s\n" % (time.time(), forwardArgs.replace('\x00', ' ')))
+
+# Just run the request on this side when no forwarding is required.
+# Therefore start gpg subprocess to replace this process.
+if not forwardRequestFlag:
+  localExecArgs=['/usr/bin/gpg']+callArgs[1:]
+  if logFile != None: logFile.write("%i: executing local gpg" % time.time())
+  os.execv(localExecArgs[0], localExecArgs)
+  if logFile != None: logFile.write("%i: local exec failed" % time.time())
+  sys.exit(1)
+
+# Connect to remote side, forward stdin/stdout
+remoteSock=socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+remoteSock.connect(remoteAddress)
+
+# Send the preamble to remote side
+remoteSock.sendall(struct.pack('I', len(forwardArgs)))
+remoteSock.sendall(forwardArgs)
+
+readFds=[0, remoteSock.fileno()]
+remoteData=''
+remoteDataParams=None
+exitStatus=-1
+
+while True:
+  rfds,wfds,xfds=select.select(readFds, [], [])
+  readFd=rfds[0]
+  data=os.read(readFd, 65536)
+  if logFile != None: print >>logFile, "Read %d from %d" % (len(data), readFd)
+  if readFd == 0:
+    if len(data) == 0:
+      if logFile != None: print >>logFile, "Sending input close notification"
+      readFds=readFds[1:]
+    data=struct.pack('i', len(data))+data
+    remoteSock.sendall(data)
+  else:
+    if len(data) == 0:
+      if logFile != None: print >>logFile, "Socket stream end, exit %d" % exitStatus
+      if exitStatus < 0: exitStatus=1
+      sys.exit(exitStatus)
+
+    remoteData=remoteData+data
+    while True:
+      if remoteDataParams == None:
+        if len(remoteData) < 8: break
+        remoteDataParams=struct.unpack('ii', remoteData[0:8])
+
+      if logFile != None: print >>logFile, "Handling %d %d" % (remoteDataParams[0], remoteDataParams[1])
+# This is magic number for exit code sending, so terminate
+      if remoteDataParams[0] == -1:
+        if logFile != None: print >>logFile, "Received exit status"
+        exitStatus=remoteDataParams[1]
+        remoteData=remoteData[8:]
+        break
+
+# So the remote file descriptor was closed, close it on this side also
+      if remoteDataParams[1] == 0:
+        os.close(remoteDataParams[0])
+        remoteData=remoteData[8:]
+        remoteDataParams=None
+        continue
+
+      if remoteDataParams[1]+8 > len(remoteData): break
+
+      os.write(remoteDataParams[0], remoteData[8:remoteDataParams[1]+8])
+      remoteData=remoteData[remoteDataParams[1]+8:]
+      remoteDataParams=None
+
+remoteSock.close()

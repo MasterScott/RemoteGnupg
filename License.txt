@@ -1,0 +1,4 @@
+This should come under a quite convenient license, where private/commercial
+use is ok, all modifications should go back into repo again.
+
+Which suits best?

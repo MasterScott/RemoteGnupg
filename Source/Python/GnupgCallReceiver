@@ -1,0 +1,147 @@
+#!/usr/bin/python
+# This software is provided by the copyright owner "as is" and any
+# expressed or implied warranties, including, but not limited to,
+# the implied warranties of merchantability and fitness for a particular
+# purpose are disclaimed. In no event shall the copyright owner be
+# liable for any direct, indirect, incidential, special, exemplary or
+# consequential damages, including, but not limited to, procurement
+# of substitute goods or services, loss of use, data or profits or
+# business interruption, however caused and on any theory of liability,
+# whether in contract, strict liability, or tort, including negligence
+# or otherwise, arising in any way out of the use of this software,
+# even if advised of the possibility of such damage.
+#
+# Copyright (c) 2013 halfdog <me (%) halfdog.net>
+#
+# This program will read one program invocation request and call
+# a local gpg helper after mangling of the request arguments.
+# While local gpg is running, it reads network data to pass it
+# to gpg as stdin and will forward both stdout and stderr data
+# to the remote side.
+#
+# Usage:
+# * --PrependArg [string]: Prepend this argument to the gpg call
+#   arguments. This parameter has to be given for each argument
+#   string to prepend.
+#
+# Source: Projects/CryptoTools/Source/Python/RemoteGnupg/GnupgCallReceiver V20131215
+
+import os
+import re
+import select
+import struct
+import subprocess
+import sys
+
+argPos=1
+prependArgs=[]
+while argPos < len(sys.argv):
+  argName=sys.argv[argPos]
+  argPos+=1
+  if '--PrependArg' == argName:
+    prependArgs=prependArgs+[sys.argv[argPos]]
+    argPos+=1
+  else:
+    print "Unsupported argument %s" % argName
+
+# Prepare the filter regex array, the None element at the end
+# triggers filter error if none of the filter expressions matches
+filterRegexArray=[
+    re.compile('^--homedir\x00[a-zA-Z0-9./_-]+\x00--charset\x00utf-8\x00--display-charset\x00utf-8\x00--batch\x00--no-tty\x00--status-fd\x002\x00-t\x00--clearsign\x00-u\x000x[0-9a-f]+\x00$'),
+    re.compile('^--homedir\x00[a-zA-Z0-9./_-]+\x00--charset\x00utf-8\x00--display-charset\x00utf-8\x00--batch\x00--no-tty\x00--status-fd\x002\x00--decrypt\x00$'),
+    None]
+
+header=os.read(0, 4)
+argLength=struct.unpack('I', header)[0]
+forwardArgData=os.read(0, argLength)
+forwardArgs=forwardArgData.split('\x00')
+if (len(forwardArgs)<=1) or (forwardArgs[len(forwardArgs)-1]!=''):
+  sys.exit(1)
+
+# Filter the received command
+for filterRegex in filterRegexArray:
+  if filterRegex == None:
+    print >>sys.stderr, "Call arguments %s forbidden by filter" % forwardArgData.replace('\x00', ' ')
+    sys.exit(1)
+  if filterRegex.match(forwardArgData): break
+
+# Remove --batch and --no-tty to make gpg work normal on local side,
+# remove homedir, does not make sense on remote side.
+argPos=0
+while argPos < len(forwardArgs):
+  if (forwardArgs[argPos] == '--batch') or (forwardArgs[argPos] == '--no-tty'):
+    forwardArgs=forwardArgs[0:argPos]+forwardArgs[argPos+1:]
+  elif forwardArgs[argPos] == '--homedir':
+    forwardArgs=forwardArgs[0:argPos]+forwardArgs[argPos+2:]
+  else:
+    argPos+=1
+
+forwardArgs=['gpg']+prependArgs+forwardArgs[:-1]
+
+for val in forwardArgs:
+  print >>sys.stderr, "Arg: %s" % val
+
+gpgProcess=subprocess.Popen(forwardArgs, stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+fdTranslationMap={0: 0, gpgProcess.stdout.fileno(): 1,
+    gpgProcess.stderr.fileno(): 2}
+readFds=[0, gpgProcess.stdout.fileno(), gpgProcess.stderr.fileno()]
+remoteData=''
+
+# Main loop: try to read from any file descriptor. If OK, try to
+# write the data
+while True:
+  rfds,wfds,xfds=select.select(readFds, [], [])
+  if len(rfds) != 0:
+    readFd=rfds[0]
+    data=os.read(readFd, 65536)
+    if len(data) == 0:
+      if readFd == 0:
+        if len(remoteData) != 0:
+          print >>sys.stderr, "Remote stream end but not all data handled: %s" % remoteData
+        gpgProcess.stdin.close()
+        readFds=readFds[1:]
+        continue
+# Find out if stdout or stderr has reached end, remove it from readFds
+      print >>sys.stderr, "Zero length data on %d for %d" % (readFd, fdTranslationMap[readFd])
+      searchPos=len(readFds)-1
+      while searchPos >= 0:
+        if readFds[searchPos] == readFd: break
+        searchPos-=1
+      if searchPos < 0:
+        print >>sys.stderr, "Unknown fd read failed"
+      else:
+        readFds=readFds[0:searchPos]+readFds[searchPos+1:len(readFds)]
+      print >>sys.stderr, "Sending close for %d" % fdTranslationMap[readFd]
+      os.write(1, struct.pack('ii', fdTranslationMap[readFd], 0))
+# Check if last input FD was closed. If yes, wait for exit and
+# forward exit status
+      if (len(readFds) == 0) or ((len(readFds) == 1) and (readFds[0] == 0)):
+        print >>sys.stderr, "Waiting for process to terminate"
+        returnCode=gpgProcess.wait()
+        print >>sys.stderr, "Sending exit code %d" % returnCode
+        os.write(1, struct.pack('ii', -1, returnCode))
+        break
+      continue
+
+    if readFd == 0:
+      remoteData=remoteData+data
+      while len(remoteData) >= 4:
+        blockLen=struct.unpack('i', remoteData[0:4])[0]
+        if blockLen < 0:
+          print >>sys.stderr, "Invalid block length %d" % blockLen
+          blockLen=0
+        if blockLen == 0:
+          readFds=readFds[1:]
+          gpgProcess.stdin.close()
+          break
+        if len(remoteData) < blockLen+4: break
+        gpgProcess.stdin.write(remoteData[4:blockLen+4])
+        gpgProcess.stdin.flush()
+        remoteData=remoteData[blockLen+4:]
+    else:
+      data=struct.pack('ii', fdTranslationMap[readFd], len(data))+data
+      os.write(1, data)
+  else:
+    sys.exit(0)
