@@ -37,7 +37,7 @@
 #     remote GnuPG instance
 # * --LogFile [filename]: logfile location (for debugging)
 #
-# Source: Projects/CryptoTools/Source/Python/RemoteGnupg/GnupgCallForwarder V20130519
+# Source: https://github.com/halfdog/RemoteGnupg.git
 
 import os
 import time

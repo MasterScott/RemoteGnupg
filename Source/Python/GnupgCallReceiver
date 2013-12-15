@@ -24,7 +24,7 @@
 #   arguments. This parameter has to be given for each argument
 #   string to prepend.
 #
-# Source: Projects/CryptoTools/Source/Python/RemoteGnupg/GnupgCallReceiver V20131215
+# Source: https://github.com/halfdog/RemoteGnupg.git
 
 import os
 import re

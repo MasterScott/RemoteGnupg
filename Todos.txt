@@ -1,0 +1,5 @@
+Todos:
+======
+
+As soon as someone else contributes, remove the references to halfdog
+project/homepage.
